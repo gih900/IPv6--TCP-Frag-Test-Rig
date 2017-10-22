@@ -759,23 +759,26 @@ resolve_v6_name(char *name, char *address, struct in6_addr *a6) {
  **************************************************/
 
 void
-resolve_dns(char *server_name) {
+resolve_dns(char *server_name, struct in6_addr *ip6_addrp ) {
   int status ;
-  char address[112];
   
   if (strchr(server_name,':')) {
-    if (!inet_pton(AF_INET6,server_name,&ip6_addr)) {
+    if (!inet_pton(AF_INET6,server_name,ip6_addrp)) {
       status = errno;
-      fprintf (stderr, "inet_pton() failed (%s).\nError message: %s",server_name, strerror (status));
+      fprintf (stderr, "inet_pton() failed (%s).\nError message: %s",server_name, strerror(status));
       exit (EXIT_FAILURE);
       }
     }
-  else if (!resolve_v6_name(server_name,0,&ip6_addr)) {
+  else if (!resolve_v6_name(server_name,0,ip6_addrp)) {
     fprintf (stderr, "dns-server-frag -d <dns-server> - unable to resolve dns server name %s\n",server_name) ;
     exit (EXIT_FAILURE);
     }
-  inet_ntop(AF_INET6,&(ip6_addr),address,112) ; 
-  if (debug) printf("Web server is at %s\n",address);
+  if (debug) {
+    char address[112];
+
+    inet_ntop(AF_INET6,ip6_addrp,address,112) ; 
+    printf("Web server is at %s\n",address);
+    }
 }
 
 
@@ -1398,7 +1401,8 @@ main(int argc, char **argv)
   argc -= optind;
   argv += optind;
 
-  resolve_dns(http_server) ;
+  resolve_dns(http_server,&http_ip6_addr) ;
+  resolve_dns(dns_server,&dns_ip6_addr) ;
   
   srand((unsigned) time(&t));
   ether_frame = allocate_ustrmem (IP_MAXPACKET); 
@@ -1419,14 +1423,14 @@ main(int argc, char **argv)
     fprintf(stderr, "Couldn't open device %s: %s\n", interface, errbuff);
     exit(EXIT_FAILURE) ;
   }	 
-	/* open send device */
+  /* open send device */
   //if ((handle_out = pcap_open_live(interface, SNAP_LEN, 1, 1, errbuff)) == NULL)   {		 
   //  fprintf(stderr, "Couldn't open device %s: %s\n", interface, errbuff);
   //  exit(EXIT_FAILURE) ;
   //}	 
 
-	if (debug) printf("Outgoing interface is %s\n", interface) ;
-	//if (debug) printf("Open PCAP capture on %s\n", pcap_int) ;
+  if (debug) printf("Outgoing interface is %s\n", interface) ;
+  if (debug) printf("Open PCAP capture on %s\n", pcap_int) ;
 	
   
   /* compile the filter expression */
