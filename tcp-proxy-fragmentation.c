@@ -833,6 +833,7 @@ send_packet_to_http(const u_char *packet, struct binding *bdp) {
   struct ip6_hdr *o_iphdr ;
   struct tcphdr *tcp ;
   struct tcphdr *orig_tcp ;
+  struct in6_addr *ip6_addr ;
   int len ;
   int i ;
   int bytes ;
@@ -860,11 +861,15 @@ send_packet_to_http(const u_char *packet, struct binding *bdp) {
   bcopy(&local6_addr,&(iphdr->ip6_src), 16) ;  
 
   // dst address
-  bcopy(&ip6_addr,&(iphdr->ip6_dst), 16);
-  
   orig_tcp = (struct tcphdr *) (packet + ETH_HDRLEN + 40) ;
+  if (ntohs(orig_tcp->th_dport) == 53)
+    ip6_addr = &(dns_ip6_addr) ;
+  else
+    ip6_addr = &(http_ip6_addr) ;
+  bcopy(ip6_addr,&(iphdr->ip6_dst), 16);
 
-  tcp = (struct tcphdr *) &(out_packet_buffer[40]);
+
+  tcp = (struct tcphdr *) &(out_packet_buffer[40]);  
   tcp->th_dport =  orig_tcp->th_dport ;
   tcp->th_sport = htons(bdp->p->portno) ;
 
@@ -872,7 +877,7 @@ send_packet_to_http(const u_char *packet, struct binding *bdp) {
   memcpy(&out_packet_buffer[44],&packet[ETH_HDRLEN + 44],len) ;
   len += 4 ;
   tcp->th_sum = 0 ;
-  tcp->th_sum = tcp_checksum(tcp,len,len,&local6_addr,&ip6_addr) ;
+  tcp->th_sum = tcp_checksum(tcp,len,len,&local6_addr,ip6_addr) ;
   
   // Destination and Source MAC addresses 
   memcpy(ether_frame, dst_mac, 6 * sizeof (uint8_t)); 
@@ -1144,31 +1149,10 @@ got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
      If found then write in the new values, compute a new checksum and
      send it on as a raw packet */
   
-  if (!v6cmp(&(ip6_addr),&(ip->ip6_src))) {
+  if (!v6cmp(&(http_ip6_addr),&(ip->ip6_src))) {
     if (dport < 1024) {
       if (debug) printf("Destination port %d < 1024 - DROPPED\n",dport);
       return ;
-      }
-    if (sport == 53) {
-      if ((tmp = port_53_ptr[dport])) {
-        if ((bdp = tmp->entry)) {
-          if (head_53 != tmp) {
-            if (tmp->nxt) tmp->nxt->prv = tmp->prv ;
-            if (tmp->prv) tmp->prv->nxt = tmp->nxt ;
-            if (tail_53 == tmp) tail_53 = tmp->prv ; 
-            tmp->nxt = head_53 ;
-            tmp->prv = 0 ;
-            head_53->prv = tmp ;
-            head_53 = tmp ;
-            }
-          tmp->entry->used = time(0) ; 
-          if (debug) printf("    send from web to client\n") ;
-          send_packet_to_inet(packet,bdp) ;
-          }
-        }
-      else {
-        if (debug) printf("COULD NOT FIND NAT binding for port 53 web response: port %d\n", dport) ;
-        }
       }
     else if (sport == 80) {
       if ((tmp = port_80_ptr[dport])) {
@@ -1220,6 +1204,35 @@ got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
     return ;
     }
 
+  if (!v6cmp(&(dns_ip6_addr),&(ip->ip6_src))) {
+    if (dport < 1024) {
+      if (debug) printf("Destination port %d < 1024 - DROPPED\n",dport);
+      return ;
+      }
+
+    if (sport == 53) {
+      if ((tmp = port_53_ptr[dport])) {
+        if ((bdp = tmp->entry)) {
+          if (head_53 != tmp) {
+            if (tmp->nxt) tmp->nxt->prv = tmp->prv ;
+            if (tmp->prv) tmp->prv->nxt = tmp->nxt ;
+            if (tail_53 == tmp) tail_53 = tmp->prv ; 
+            tmp->nxt = head_53 ;
+            tmp->prv = 0 ;
+            head_53->prv = tmp ;
+            head_53 = tmp ;
+            }
+          tmp->entry->used = time(0) ; 
+          if (debug) printf("    send from web to client\n") ;
+          send_packet_to_inet(packet,bdp) ;
+          }
+        }
+      else {
+        if (debug) printf("COULD NOT FIND NAT binding for port 53 web response: port %d\n", dport) ;
+        }
+      }
+    return ;
+    }
     
   /* OTHERWISE assemble the <source-address,dst-address,src-port,dst-port> vector 
      and set up the translation, replacing the source address with the
@@ -1422,15 +1435,16 @@ main(int argc, char **argv)
   if ((handle = pcap_open_live(interface, SNAP_LEN, 1, 1, errbuff)) == NULL)   {		 
     fprintf(stderr, "Couldn't open device %s: %s\n", interface, errbuff);
     exit(EXIT_FAILURE) ;
-  }	 
+    }
+	 
   /* open send device */
   //if ((handle_out = pcap_open_live(interface, SNAP_LEN, 1, 1, errbuff)) == NULL)   {		 
   //  fprintf(stderr, "Couldn't open device %s: %s\n", interface, errbuff);
   //  exit(EXIT_FAILURE) ;
   //}	 
+  //if (debug) printf("Open PCAP capture on %s\n", pcap_int) ;
 
   if (debug) printf("Outgoing interface is %s\n", interface) ;
-  if (debug) printf("Open PCAP capture on %s\n", pcap_int) ;
 	
   
   /* compile the filter expression */
