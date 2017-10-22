@@ -54,6 +54,7 @@ char *interface = "eth0" ;
 //char *pcap_int = "eno1" ;
 char *host = "2401:2000:6660::122";
 char *http_server = "2001:388:1000:120:d267:e5ff:feef:a842" ;
+char *dns_server = "2001:4860:4860::8888";
 
 int port ;
 uint8_t src_mac[6] = {0x14,0x18,0x77,0x43,0xb9,0xb8};
@@ -70,7 +71,8 @@ int frame_length ;
 
 char *src_ip;
 char *dst_ip ;
-struct in6_addr ip6_addr ;
+struct in6_addr http_ip6_addr ;
+struct in6_addr dns_ip6_addr ;
 struct in6_addr local6_addr;
 
 struct sockaddr_ll device ;
@@ -86,11 +88,14 @@ struct binding {
   } ;
 
 /* we will use a AVL tree to index the binding table */
+avl_ptr addr_table_53 = 0 ;
 avl_ptr addr_table_80 = 0 ;
 avl_ptr addr_table_443 = 0 ;
 
-/* first free port numbers for ports 80 and 443 */
+/* first free port numbers for ports 53, 80 and 443 */
 int first_call = 1 ;
+uint16_t freeport_53 = 0 ;
+uint16_t p53list[64512] ;
 uint16_t freeport_80 = 0 ;
 uint16_t p80list[64512] ;
 uint16_t freeport_443 = 0 ;
@@ -105,7 +110,8 @@ struct ports {
   struct binding *entry ;
   struct ports *nxt ;
   struct ports *prv ;
-  } *head_80 = 0, *tail_80 = 0,  *port_80_ptr[65535],
+  } *head_53 = 0, *tail_53 = 0,  *port_53_ptr[65535],
+    *head_80 = 0, *tail_80 = 0,  *port_80_ptr[65535],
     *head_443 = 0, *tail_443 = 0,  *port_443_ptr[65535];
 
 pcap_t *handle ;                       /* packet capture handle */
@@ -161,7 +167,11 @@ find_binding(struct binding *b,uint16_t selector) {
   
   local.payload = &bdg ;
   bcopy(b,&bdg,sizeof bdg) ;
-  if (selector == 80) {
+  if (selector == 53) {
+    if ((tmp = avlaccess(addr_table_53,&local,bind_cmp)))
+      return((struct binding *)tmp->payload) ;
+    }
+  else if (selector == 80) {
     if ((tmp = avlaccess(addr_table_80,&local,bind_cmp)))
       return((struct binding *)tmp->payload) ;
     }
@@ -191,14 +201,90 @@ init_arrays() {
   if (first_call) {
     int i ;
     for (i = 0 ; i < 64512; ++i) {
+      p53list[i] = i + 1024 ; 
       p80list[i] = i + 1024 ; 
       p443list[i] = i + 1024 ;
       }
+    shuffle(p53list,64512) ;
     shuffle(p80list,64512) ;
     shuffle(p443list,64512) ;
     first_call = 0 ;
     }
     
+}
+
+/**************************
+ * next_port_53 
+ * find the next free port, or if none free then remove the oldest from the table
+ **************************/
+
+uint16_t
+next_port_53(struct in6_addr *ip6_addr, uint16_t port) {
+  struct ports *tmp ;
+  struct binding bdg ;
+  struct binding *brtn ;
+  struct avldata local ;
+  avl_ptr ttmp ;
+  uint16_t pport ;
+
+  if (first_call) init_arrays() ;
+
+  if (freeport_53 < 64512) {
+    pport = p53list[freeport_53] ;
+    ++freeport_53 ;
+    /* add this to the head of the queue */
+    tmp = malloc(sizeof *tmp) ;
+    tmp->portno = pport ;
+    tmp->nxt = head_53 ;
+    tmp->prv = 0 ;
+    tmp->entry = 0 ;
+    if (head_53) head_53->prv = tmp ;
+    head_53 = tmp ;
+    if (!tail_53) tail_53 = tmp ;
+    port_53_ptr[pport] = tmp ;
+    }
+  else {
+    /* recycle the tail of the queue to the head of the queue */
+    tmp = tail_53 ;
+    tail_53 = tail_53->prv ;
+    if (tail_53)
+      tail_53->nxt = 0 ;
+  
+    /* now clear out the associated binding entry from the table */
+    if (tmp->entry) {
+      local.payload = tmp->entry ;
+      avlremove(&addr_table_53,&local,bind_cmp) ;
+      free(tmp->entry) ;
+      }
+    tmp->prv = 0 ;
+    tmp->nxt = head_53 ;
+    if (head_53) head_53->prv = tmp ;
+    head_53 = tmp ;
+    if (!tail_53)
+      tail_53 = tmp ;
+    head_53 = tmp ;
+    }
+  /* now put in the new entry in the port 53 binding table */
+  local.payload = &bdg ;
+  bcopy(ip6_addr,&bdg.ip6_src,16) ;
+  bdg.sport = port ;
+  avlinserted = 0 ;
+  avlinsert(&addr_table_53,&local,bind_cmp) ;
+  ttmp = avl_inserted ;
+  if (avlinserted) {
+    brtn = (struct binding *)malloc(sizeof *brtn) ;
+    bcopy(&bdg,brtn,sizeof bdg);
+    brtn->seq = 0 ;
+    ttmp->payload = brtn ;
+    }
+  else {
+    brtn = ttmp->payload ;
+    brtn->seq = 0 ;
+    }
+  tmp->entry = brtn ; 
+  brtn->used = time(0) ;
+  brtn->p = tmp ;
+  return(tmp->portno) ;
 }
 
 /**************************
@@ -1060,7 +1146,28 @@ got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
       if (debug) printf("Destination port %d < 1024 - DROPPED\n",dport);
       return ;
       }
-    if (sport == 80) {
+    if (sport == 53) {
+      if ((tmp = port_53_ptr[dport])) {
+        if ((bdp = tmp->entry)) {
+          if (head_53 != tmp) {
+            if (tmp->nxt) tmp->nxt->prv = tmp->prv ;
+            if (tmp->prv) tmp->prv->nxt = tmp->nxt ;
+            if (tail_53 == tmp) tail_53 = tmp->prv ; 
+            tmp->nxt = head_53 ;
+            tmp->prv = 0 ;
+            head_53->prv = tmp ;
+            head_53 = tmp ;
+            }
+          tmp->entry->used = time(0) ; 
+          if (debug) printf("    send from web to client\n") ;
+          send_packet_to_inet(packet,bdp) ;
+          }
+        }
+      else {
+        if (debug) printf("COULD NOT FIND NAT binding for port 53 web response: port %d\n", dport) ;
+        }
+      }
+    else if (sport == 80) {
       if ((tmp = port_80_ptr[dport])) {
         if ((bdp = tmp->entry)) {
           if (head_80 != tmp) {
@@ -1117,7 +1224,7 @@ got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
      write the table entry if it does not exist and pass the packet to the
      back end http server */
 
-  if ((dport != 80) && (dport != 443)) return ;
+  if ((dport != 53) && (dport != 80) && (dport != 443)) return ;
   if (debug) printf("got packet from internet\n") ; 
   bcopy(&(ip->ip6_src), &(bdg.ip6_src),16) ; 
   bdg.sport = sport ;
@@ -1130,7 +1237,11 @@ got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
   if ((!bdp) && (tcp->th_flags & TH_SYN)) {
     /* at this point we need to create a new binding table entry */
     if (debug) printf("SYN - new binding\n") ;
-    if (dport == 80) {
+    if (dport == 53) {
+      port = next_port_53(&(ip->ip6_src),ntohs(tcp->th_sport)) ;
+      bdp = port_53_ptr[port]->entry ;
+      }
+    else if (dport == 80) {
       port = next_port_80(&(ip->ip6_src),ntohs(tcp->th_sport)) ;
       bdp = port_80_ptr[port]->entry ;
       }
@@ -1155,7 +1266,23 @@ got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
   bdp->seq = tcp->th_seq ;
 
   tmp = bdp->p ;
-  if (dport == 80) {
+  if (dport == 53) {
+    if (tmp != head_53) {
+      if (tmp == tail_53) {
+        tail_53 = tmp->prv ; 
+        tail_53->nxt = 0 ;
+        }
+      else {
+        if (tmp->nxt) tmp->nxt->prv = tmp->prv ;
+        if (tmp->prv) tmp->prv->nxt = tmp->nxt ;
+        }
+      tmp->nxt = head_53 ;
+      tmp->prv = 0 ;
+      head_53->prv = tmp ;
+      head_53 = tmp ;
+      }
+    }
+  else if (dport == 80) {
     if (tmp != head_80) {
       if (tmp == tail_80) {
         tail_80 = tmp->prv ; 
@@ -1210,7 +1337,7 @@ main(int argc, char **argv)
 
   int status ;
 
-  while (((ch = getopt(argc,argv, "i:p:d:s:h:l:x:"))) != -1) {
+  while (((ch = getopt(argc,argv, "i:p:g:d:s:h:l:x:"))) != -1) {
     switch(ch) {
       case 'i':
         // interface name of 'listen' address
@@ -1229,7 +1356,7 @@ main(int argc, char **argv)
 
         break ;
         
-      case 'd':
+      case 'g':
         // mac address of V6 gateway on listen address network
 				if (sscanf(optarg, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &dst_mac[0], &dst_mac[1], &dst_mac[2], &dst_mac[3], &dst_mac[4], &dst_mac[5]) != 6) {
           fprintf(stderr,"%s not a MAC address\n",optarg) ;
@@ -1239,7 +1366,7 @@ main(int argc, char **argv)
 				break;
 	
       case 's':
-        // mac address of V6 gateway on listen address network
+        // mac address of local ethernet interface
 				if (sscanf(optarg, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &src_mac[0], &src_mac[1], &src_mac[2], &src_mac[3], &src_mac[4], &src_mac[5]) != 6) {
           fprintf(stderr,"%s not a MAC address\n",optarg) ;
           exit(1) ;
@@ -1251,12 +1378,16 @@ main(int argc, char **argv)
         http_server = strdup(optarg) ;
         break ;
 
+      case 'd':
+        dns_server = strdup(optarg) ;
+        break ;
+
       case 'x':
         debug = strcmp(optarg,"0") ;
         break;
 
       default:
-        fprintf(stderr, "http-server-frag  parameters\n  -i interface\n -p pcap_interface\n -l listen IPv6 address\n  -h http(s) server\n  -d mac address of the local gateway -x <debug>\n\ne.g. http-proxy -i eth0 -l 2a01:4f8:161:50ad::e:cd5a -h www.potaroo.net -x 0\n") ;
+        fprintf(stderr, "tcp-proxy  parameters\n  -i interface\n -p pcap_interface\n -l listen IPv6 address\n  -h http(s) server\n  -d dns server\n  -g mac address of the local gateway -x <debug>\n\ne.g. http-proxy -i eth0 -l 2a01:4f8:161:50ad::e:cd5a -h www.potaroo.net -x 0\n") ;
         exit (EXIT_FAILURE);
       }
     }
@@ -1281,7 +1412,7 @@ main(int argc, char **argv)
     }  
     
   /* the PCAP capture filter  - http and https v6 traffic only*/
-  sprintf(filter_exp,"dst host %s and (port 80 or port 443) and tcp and ip6",host);
+  sprintf(filter_exp,"dst host %s and (port 80 or port 443 or port 53) and tcp and ip6",host);
 
   /* open capture device */  
   if ((handle = pcap_open_live(interface, SNAP_LEN, 1, 1, errbuff)) == NULL)   {		 
